@@ -1,45 +1,32 @@
+"""
+Streamlit UI for the Coal Mine Accidents Q&A bot.
+
+All retrieval / prompting / Gemini logic now lives in agent.py (single source of truth):
+    dense FAISS + BM25 + topic-tag list -> RRF -> cross-encoder rerank (+ tag/year/name boosts)
+    -> Gemini with exponential backoff and fallback model.
+This file only adds the chat UI and the optional RAGAS-style LLM-judge evaluation.
+Keep agent.py in the same folder as this file.
+"""
 import json
-import pickle
+import os
 import random
 import re
 import time
-from pathlib import Path
 
-import faiss
-import numpy as np
 import streamlit as st
-from google import genai
-from google.genai import errors, types
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
-# =========================
-# Fixed configuration
-# =========================
-BASE_DIR = Path(__file__).parent
-INDEX_PATH = BASE_DIR / "coal.faiss"
-META_PATH = BASE_DIR / "coal.pkl"
+# agent.py reads the key from the environment: bridge Streamlit secrets -> env BEFORE importing it.
+try:
+    if "GEMINI_API_KEY" in st.secrets and not os.getenv("GEMINI_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    pass
 
-EMBED_MODEL = "all-MiniLM-L6-v2"  # must match build_index.py
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+import agent  # noqa: E402
+from google.genai import errors, types  # noqa: E402
 
-DENSE_K = 20
-BM25_K = 20
-RRF_K = 60
-FUSED_POOL = 20
-FINAL_K = 5
-MIN_RERANK_SCORE = -6.0
-
-PRIMARY_MODEL = "gemini-3.5-flash-lite"
-FALLBACK_MODEL = "gemini-3.1-flash-lite"
-JUDGE_MODEL = PRIMARY_MODEL  # ideally a different/stronger model than the generator
-
-MAX_RETRIES = 5
-BASE_DELAY = 2.0
-MAX_DELAY = 30.0
-RETRYABLE_CODES = {429, 500, 503, 504}
-
-NO_ANSWER = "I don't know based on the provided report."
+NO_ANSWER = agent.NO_ANSWER
+JUDGE_MODEL = agent.PRIMARY_MODEL  # ideally a different/stronger model than the generator
 
 METRIC_LABELS = {
     "context_precision": "Context precision",
@@ -53,124 +40,49 @@ METRIC_LABELS = {
 # =========================
 # Cached resources
 # =========================
-def tokenize(text: str):
-    return re.findall(r"\w+", text.lower())
-
-
 @st.cache_resource(show_spinner="Loading index and models…")
 def load_resources():
-    index = faiss.read_index(str(INDEX_PATH))
-    with open(META_PATH, "rb") as f:
-        meta = pickle.load(f)
-    texts, sources = meta["texts"], meta["sources"]
-    embedder = SentenceTransformer(EMBED_MODEL)
-    reranker = CrossEncoder(RERANK_MODEL, max_length=512)
-    bm25 = BM25Okapi([tokenize(t) for t in texts])
-    return index, texts, sources, embedder, reranker, bm25
-
-
-@st.cache_resource
-def get_client():
-    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    return agent.load_resources()
 
 
 # =========================
-# Retrieval: dense + BM25 -> RRF -> cross-encoder rerank
+# Pipeline (mirrors agent.ask, but keeps the hits for display + evaluation)
 # =========================
-def reciprocal_rank_fusion(rankings, k: int = RRF_K):
-    scores = {}
-    for ranking in rankings:
-        for rank, doc_id in enumerate(ranking):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-    return sorted(scores, key=scores.get, reverse=True)
+def answer_query(query: str):
+    """Returns (answer, hits). Gemini failures are caught by the caller."""
+    topics, _, is_list = agent.analyse_query(query)
+    hits = agent.retrieve(query, agent.LIST_K if is_list else agent.FINAL_K, is_list)
 
+    if not hits or (hits[0][2] < agent.MIN_RERANK_SCORE and not topics):
+        return f"{NO_ANSWER} I couldn't find a relevant passage.", hits
 
-def retrieve(query, index, texts, sources, embedder, reranker, bm25):
-    n = len(texts)
-
-    q = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-    _, I = index.search(q, min(DENSE_K, n))
-    dense_ids = [int(i) for i in I[0] if i >= 0]
-
-    bm25_scores = bm25.get_scores(tokenize(query))
-    bm25_ids = [int(i) for i in np.argsort(bm25_scores)[::-1][:BM25_K] if bm25_scores[i] > 0]
-
-    fused_ids = reciprocal_rank_fusion([dense_ids, bm25_ids])[:FUSED_POOL]
-
-    pairs = [(query, texts[i]) for i in fused_ids]
-    ce_scores = reranker.predict(pairs)
-    order = np.argsort(ce_scores)[::-1][:FINAL_K]
-    return [(texts[fused_ids[o]], sources[fused_ids[o]], float(ce_scores[o])) for o in order]
+    tokens = agent.LIST_MAX_TOKENS if is_list else agent.QA_MAX_TOKENS
+    answer = agent.ask_gemini(agent.build_qa_prompt(hits), f"Question: {query}", max_tokens=tokens)
+    return answer, hits
 
 
 # =========================
-# Prompt
+# Judge call (JSON mode) with the same backoff policy as agent.py
 # =========================
-SYSTEM_TEMPLATE = """You are a precise analyst answering questions about the DGMS SANKET report \
-"Key Evaluation of Trends in Coal Mine Accidents" (India).
-
-RULES
-1. Use ONLY the information inside <context>. Never use outside knowledge, and never guess.
-2. If the context does not contain enough information to answer, reply exactly: "{no_answer}" \
-You may add one short sentence on what is missing.
-3. Numbers, years, percentages and names must be copied exactly as written in the context. \
-Do not round, convert or extrapolate unless the user asks you to calculate; if you calculate, \
-show the values used and the arithmetic.
-4. For comparisons, trends or multi-part questions: first list the relevant facts from the context, \
-then derive the conclusion from those facts only.
-5. If excerpts conflict or are ambiguous (e.g., different years or units), say so explicitly.
-6. Cite the source of every factual statement inline as [file - page N], using the labels on the excerpts.
-7. Be concise. Start with the direct answer, then the supporting evidence. No preamble.
-
-<context>
-{context}
-</context>"""
-
-
-def build_system_prompt(hits):
-    context = "\n\n".join(
-        f'<excerpt source="{src}">\n{txt}\n</excerpt>' for txt, src, _ in hits
-    )
-    return SYSTEM_TEMPLATE.format(no_answer=NO_ANSWER, context=context)
-
-
-# =========================
-# Gemini call with exponential backoff
-# =========================
-def generate_with_backoff(client, model, system_prompt, contents, temperature=0.0,
-                          max_tokens=1024, json_mode=False):
-    for attempt in range(MAX_RETRIES):
+def judge_generate(prompt: str, max_tokens: int = 3072) -> str:
+    client = agent._get_client()
+    for attempt in range(agent.MAX_RETRIES):
         try:
-            cfg = dict(
-                system_instruction=system_prompt,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            )
-            if json_mode:
-                cfg["response_mime_type"] = "application/json"
             resp = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(**cfg),
+                model=JUDGE_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                ),
             )
             return resp.text or ""
         except errors.APIError as e:
-            if e.code not in RETRYABLE_CODES or attempt == MAX_RETRIES - 1:
+            if e.code not in agent.RETRYABLE_CODES or attempt == agent.MAX_RETRIES - 1:
                 raise
-            delay = min(MAX_DELAY, BASE_DELAY * (2 ** attempt)) + random.uniform(0, 1)
+            delay = min(agent.MAX_DELAY, agent.BASE_DELAY * (2 ** attempt)) + random.uniform(0, 1)
             time.sleep(delay)
-
-
-def ask_gemini(client, system_prompt: str, query: str) -> str:
-    contents = f"Question: {query}"
-    try:
-        out = generate_with_backoff(client, PRIMARY_MODEL, system_prompt, contents)
-    except errors.APIError as e:
-        if e.code in RETRYABLE_CODES:
-            out = generate_with_backoff(client, FALLBACK_MODEL, system_prompt, contents)
-        else:
-            raise
-    return out or "I couldn't generate an answer."
 
 
 # =========================
@@ -246,27 +158,23 @@ def clamp01(v):
         return None
 
 
-def evaluate_rag(client, query, hits, answer, reference=""):
+def evaluate_rag(query, hits, answer, reference=""):
     """Returns a dict of metrics (None = not computable). Uses one judge LLM call."""
     refused = answer.startswith(NO_ANSWER)
-    raw = generate_with_backoff(
-        client, JUDGE_MODEL, None, build_judge_prompt(query, hits, answer, reference.strip()),
-        temperature=0.0, max_tokens=2048, json_mode=True,
-    )
-    data = parse_json(raw)
+    has_ref = bool(reference.strip())
+    data = parse_json(judge_generate(build_judge_prompt(query, hits, answer, reference.strip())))
 
     rel = [int(bool(x)) for x in data.get("chunk_relevance", [])][: len(hits)]
     rel += [0] * (len(hits) - len(rel))
 
-    metrics = {
+    return {
         "chunk_relevance": rel,
         "context_precision": context_precision(rel),
-        "context_recall": ratio(data.get("reference_statements") or []) if reference.strip() else None,
+        "context_recall": ratio(data.get("reference_statements") or []) if has_ref else None,
         "faithfulness": None if refused else ratio(data.get("answer_claims") or []),
         "answer_relevancy": None if refused else clamp01(data.get("answer_relevancy")),
-        "answer_correctness": clamp01(data.get("answer_correctness")) if reference.strip() else None,
+        "answer_correctness": clamp01(data.get("answer_correctness")) if has_ref else None,
     }
-    return metrics
 
 
 def fmt(v):
@@ -298,10 +206,10 @@ def render_metrics(m):
 st.set_page_config(page_title="Coal Mine Accidents Q&A", page_icon="⛏️", layout="wide")
 st.title("⛏️ Coal Mine Accidents Q&A")
 st.caption("RAG chatbot over DGMS SANKET – Key Evaluation of Trends in Coal Mine Accidents "
-           "(Hybrid BM25 + FAISS · RRF · Cross-encoder rerank · Gemini)")
+           "(Hybrid BM25 + FAISS + topic tags · RRF · Cross-encoder rerank + boosts · Gemini)")
 
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("❌ `GEMINI_API_KEY` not found in Streamlit secrets.")
+if not os.getenv("GEMINI_API_KEY"):
+    st.error("❌ `GEMINI_API_KEY` not found in Streamlit secrets or environment.")
     st.stop()
 
 with st.sidebar:
@@ -315,8 +223,11 @@ with st.sidebar:
     )
     avg_box = st.container()
 
-index, texts, sources, embedder, reranker, bm25 = load_resources()
-client = get_client()
+try:
+    load_resources()
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -332,43 +243,35 @@ if query := st.chat_input("Ask a question about coal mine accidents…"):
         st.markdown(query)
 
     metrics = None
+    hits = []
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             t0 = time.perf_counter()
-            hits = retrieve(query, index, texts, sources, embedder, reranker, bm25)
-            t_retrieval = time.perf_counter() - t0
-
-            t1 = time.perf_counter()
-            if not hits or hits[0][2] < MIN_RERANK_SCORE:
-                answer = f"{NO_ANSWER} I couldn't find a relevant passage."
-            else:
-                try:
-                    answer = ask_gemini(client, build_system_prompt(hits), query)
-                except errors.APIError as e:
-                    answer = f"Sorry, the Gemini API request failed ({e.code}). Please try again in a moment."
-                except Exception as e:
-                    answer = f"Sorry, something went wrong: {e}"
-            t_generation = time.perf_counter() - t1
+            try:
+                answer, hits = answer_query(query)
+            except errors.APIError as e:
+                answer = f"Sorry, the Gemini API request failed ({e.code}). Please try again in a moment."
+            except Exception as e:
+                answer = f"Sorry, something went wrong: {e}"
+            t_total = time.perf_counter() - t0
 
         st.markdown(answer)
 
-        if eval_on and hits:
+        failed = answer.startswith("Sorry,")
+        if eval_on and hits and not failed:
             with st.spinner("Evaluating…"):
                 try:
-                    metrics = evaluate_rag(client, query, hits, answer, reference)
+                    metrics = evaluate_rag(query, hits, answer, reference)
                 except Exception as e:
                     metrics = {"error": str(e)}
-            metrics.update(
-                t_retrieval=t_retrieval,
-                t_generation=t_generation,
-                top_rerank=hits[0][2],
-            )
+            # retrieval + generation are now one pipeline call; report the total as generation time
+            metrics.update(t_retrieval=0.0, t_generation=t_total, top_rerank=hits[0][2])
 
         rel = (metrics or {}).get("chunk_relevance")
         with st.expander("Sources"):
             for i, (txt, src, score) in enumerate(hits):
                 mark = "" if not rel else ("✅ " if rel[i] else "❌ ")
-                st.markdown(f"{mark}**{src}** (rerank score: `{score:.2f}`)")
+                st.markdown(f"{mark}**{src}** (score: `{score:.2f}`)")
                 st.caption(txt[:300] + ("…" if len(txt) > 300 else ""))
         render_metrics(metrics)
 
