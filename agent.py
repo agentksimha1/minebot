@@ -187,6 +187,9 @@ def load_resources() -> _Resources:
         _resources = _Resources(index, texts, sources, embedder, reranker, bm25,
                                 tags, kinds, meta_l, states, mines)
         n_tagged = sum(1 for t in tags if t)
+        if not any(k == "summary" for k in kinds):
+            print(f"⚠️ {INDEX_PATH} has NO summary chunks - it is an old index. Re-run build_index.py "
+                  "(it now writes to vectorstore/) and restart.")
         print(f"✅ RAG resources ready ({len(texts)} chunks, {n_tagged} tagged accident chunks).")
     return _resources
 
@@ -234,9 +237,14 @@ EXTRA_EXPANSIONS = [
      "injuries injured killed persons succumbed hospital"),
     (re.compile(r"\bcause[sd]?\b|why|reason", re.I),
      "cause resulted while"),
+    (RANK_RE := re.compile(r"\bsaf(?:e|er|est)\b|\bleast\b|\bfewest\b|\blowest\b|less(?:er)? number|\bminimum\b|"
+                           r"\bbest\b|\brank\w*|\bworst\b|unsafe|dangerous", re.I),
+     "company-wise subsidiary coalfields limited state wise fatal accidents fatalities summary"),
 ]
+# a ranking question that is about places / organisations (not about one accident topic)
+ENTITY_RE = re.compile(r"\bmines?\b|compan\w+|\bowners?\b|subsidiar\w+|coalfield\w*|\bstates?\b|\bwhere\b|\bsites?\b", re.I)
 LIST_RE = re.compile(r"\b(some|few|several|list|all|every|examples?|cases|incidents|which mines|mines where|"
-                     r"show me|give me|names? of|different|various|top)\b", re.I)
+                     r"show me|give me|names? of|different|various|top|safer|safest|fewest|least)\b", re.I)
 STAT_RE = re.compile(r"how many|number of|\bcount\b|\btotal\b|trend|percent\w*|statistic\w*|per year|"
                      r"year[- ]wise|compare|comparison|increase|decrease|highest|lowest|maximum|minimum", re.I)
 YEAR_RE = re.compile(r"\b(20(?:1[6-9]|2[0-2]))\b")
@@ -316,7 +324,23 @@ def retrieve(query: str, final_k: int = FINAL_K, is_list: bool = None):
                 s += NAME_BOOST
         scored.append((s, i))
     scored.sort(reverse=True)
-    return [(r.texts[i], r.sources[i], s) for s, i in scored[:final_k]]
+    hits = [(r.texts[i], r.sources[i], s) for s, i in scored[:final_k]]
+
+    # Ranking questions ("safer mines", "fewest accidents"): the reranker buries the computed summary
+    # chunks, so put the relevant ones into the context directly instead of hoping they rank.
+    if RANK_RE.search(query) and ENTITY_RE.search(query):
+        wanted = ["owner", "state"] + (["mine"] if re.search(r"\bmines?\b|\bwhere\b|\bsites?\b", query, re.I) else [])
+        picked, per_kind = [], {}
+        for i, k in enumerate(r.kinds):
+            if k != "summary":
+                continue
+            sk = (r.meta[i] or {}).get("summary")
+            if sk in wanted and per_kind.get(sk, 0) < (2 if sk == "mine" else 2):
+                per_kind[sk] = per_kind.get(sk, 0) + 1
+                picked.append((r.texts[i], r.sources[i], 10.0))
+        if picked:
+            hits = picked + hits[:5]
+    return hits
 
 
 # =========================
@@ -332,6 +356,8 @@ describes injuries - including burn injuries and other persons hurt) and "PRECAU
 PREVENTED IT" (DGMS's "Had... this accident could have been averted" findings: the lapses, and the \
 regulations/precautions that were NOT followed).
 - "TABLE" and plain text excerpts hold statistics and analysis; "Major accident" rows list events with 4+ deaths.
+- "SUMMARY" excerpts are counts computed from the case write-ups (fatal cases per owner company, state or mine, \
+fewest first). Their source label reads "computed summary (...)".
 
 RULES
 1. Use ONLY the information inside <context>. Never use outside knowledge, and never guess.
@@ -348,6 +374,12 @@ round or extrapolate unless asked to calculate; if you calculate, show the value
 6. If excerpts conflict or are ambiguous (different years or units), say so explicitly.
 7. Cite every factual statement inline as [file - page N] (copy the page label of the excerpt; for \
 accident cases add the case number, e.g. [file - page 63 | case 29]).
+9. For "safer / safest / fewest accidents" questions: the report only lists accidents, so a mine, company or \
+state with zero accidents never appears and nothing can be called "safe". Use the SUMMARY excerpts: name the \
+companies, states or mines with the FEWEST fatal cases, show their counts, and cite the summary label \
+(e.g. [file - computed summary (owner companies)]). State in one sentence that this ranks reported fatal \
+accidents only (2016-2022), not overall safety, and is not adjusted for mine size or production. \
+Do NOT answer "{no_answer}" when SUMMARY excerpts are present.
 8. For multi-case answers use one short block per case: Mine / owner / state / date; persons killed and \
 injuries; cause (what happened); precautions that could have prevented it. Start with a one-line summary \
 of how many matching cases you are showing. Be concise otherwise; no preamble.
