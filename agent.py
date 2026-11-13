@@ -362,8 +362,10 @@ fewest first). Their source label reads "computed summary (...)".
 RULES
 1. Use ONLY the information inside <context>. Never use outside knowledge, and never guess.
 2. Answer as much as the context supports. Give every case you can find that matches the question \
-(do not stop at one). If only part of the question is covered, answer that part and state in one short \
-sentence what is missing. Reply exactly "{no_answer}" only if NOTHING in the context is relevant.
+(do not stop at one). If only part of the question is covered, answer that part and simply leave the rest \
+out. NEVER write "I don't know", "I do not know" or "{no_answer}" anywhere in an answer that contains any \
+information - not at the end, not as a closing remark. Use that exact sentence ONLY as the entire reply when \
+NOTHING in the context is relevant.
 3. When asked for "precautions they might have taken / should have taken", answer from the PRECAUTIONS \
 section and phrase it as what DGMS found should have been done. Do not claim what precautions a mine \
 actually had in place unless an excerpt says so. If a case says the report lists no precaution findings, say so.
@@ -383,6 +385,9 @@ Do NOT answer "{no_answer}" when SUMMARY excerpts are present.
 8. For multi-case answers use one short block per case: Mine / owner / state / date; persons killed and \
 injuries; cause (what happened); precautions that could have prevented it. Start with a one-line summary \
 of how many matching cases you are showing. Be concise otherwise; no preamble.
+10. Earlier turns of this conversation may precede the question. Use them only to understand follow-ups \
+("it", "that mine", "the second case", "what about 2019?"); you may reuse facts you already stated in \
+earlier answers, but any NEW fact must come from <context>.
 
 <context>
 {context}
@@ -446,7 +451,7 @@ def generate_with_backoff(client, model, system_prompt, contents, temperature=0.
             time.sleep(delay)
 
 
-def ask_gemini(system_prompt: str, contents: str, temperature=0.0, max_tokens=QA_MAX_TOKENS) -> str:
+def ask_gemini(system_prompt: str, contents, temperature=0.0, max_tokens=QA_MAX_TOKENS) -> str:
     """Primary model with backoff, then the fallback model. Raises on failure or empty output."""
     client = _get_client()
     try:
@@ -465,17 +470,109 @@ def ask_gemini(system_prompt: str, contents: str, temperature=0.0, max_tokens=QA
 # =========================
 # Public pipelines
 # =========================
-def ask(query: str) -> str:
-    """Strict Q&A grounded in the report, with inline citations."""
-    topics, _, is_list = analyse_query(query)
-    hits = retrieve(query, LIST_K if is_list else FINAL_K, is_list)
+# =========================
+# Conversation memory + answer cleaning
+# =========================
+MAX_HISTORY_MESSAGES = 8       # last 4 exchanges are sent to the model
+MAX_HISTORY_CHARS = 1500       # per earlier message (long answers are truncated)
+
+FOLLOWUP_RE = re.compile(
+    r"\b(it|its|that|those|these|this|they|them|their|he|she|his|her|there|same|above|previous|earlier|"
+    r"former|latter|first|second|third|last|more|another|also|else|other|further)\b|^\s*(and|also|what about|how about|why)\b",
+    re.I)
+
+# a trailing "I don't know ..." sentence/line (optionally wrapped in markdown) at the very end of an answer
+_IDK_TAIL = re.compile(r"[\s*_>\-]*I\s+(?:don['’]?t|do\s+not)\s+know\b[^\n]*$", re.I)
+
+
+def clean_answer(text: str) -> str:
+    """Remove a closing 'I don't know ...' from an answer that already contains real content."""
+    out = text.strip()
+    for _ in range(3):  # the model sometimes repeats it
+        stripped = _IDK_TAIL.sub("", out).rstrip()
+        if stripped == out:
+            break
+        out = stripped
+    if len(out) < 40:   # nothing of substance besides the phrase: keep the genuine refusal
+        return text.strip()
+    return out
+
+
+def _trim_history(history):
+    """Keep the last N messages, starting with a user turn and strictly alternating roles."""
+    msgs = []
+    for m in (history or [])[-MAX_HISTORY_MESSAGES:]:
+        role = "user" if m.get("role") == "user" else "model"
+        content = str(m.get("content", "")).strip()
+        if not content:
+            continue
+        if len(content) > MAX_HISTORY_CHARS:
+            content = content[:MAX_HISTORY_CHARS] + " ..."
+        if msgs and msgs[-1][0] == role:          # merge consecutive same-role turns
+            msgs[-1] = (role, msgs[-1][1] + "\n" + content)
+        else:
+            msgs.append((role, content))
+    while msgs and msgs[0][0] != "user":
+        msgs.pop(0)
+    return msgs
+
+
+def _build_contents(history, query: str):
+    """Gemini multi-turn contents: earlier turns + the new question."""
+    contents = [types.Content(role=r, parts=[types.Part(text=t)]) for r, t in _trim_history(history)]
+    if contents and contents[-1].role == "user":  # keep strict alternation before the new user turn
+        contents.pop()
+    contents.append(types.Content(role="user", parts=[types.Part(text=f"Question: {query}")]))
+    return contents
+
+
+def _standalone_query(query: str, history) -> str:
+    """Rewrite a follow-up ('what precautions?') into a self-contained search query.
+    One LLM call, single attempt; falls back to previous question + this one."""
+    msgs = _trim_history(history)
+    if not msgs:
+        return query
+    short = len(tokenize(query)) <= 10
+    if not (short or FOLLOWUP_RE.search(query)):
+        return query                                   # already self-contained: no extra API call
+    last_user = next((t for r, t in reversed(msgs) if r == "user"), "")
+    fallback = f"{last_user[:300]} {query}".strip()
+    try:
+        transcript = "\n".join(f"{'User' if r == 'user' else 'Assistant'}: {t[:400]}" for r, t in msgs[-4:])
+        resp = _get_client().models.generate_content(
+            model=PRIMARY_MODEL,
+            contents=f"{transcript}\n\nLatest user message: {query}",
+            config=types.GenerateContentConfig(
+                system_instruction=("Rewrite the latest user message as ONE standalone search question about "
+                                    "coal mine accidents in India, resolving pronouns and references (it, that "
+                                    "mine, the second case...) from the conversation. Keep names, years and "
+                                    "places exactly. Output only the question."),
+                temperature=0.0, max_output_tokens=120),
+        )
+        rewritten = (resp.text or "").strip().strip('"').splitlines()[0] if resp.text else ""
+        return rewritten[:400] if len(rewritten) >= 8 else fallback
+    except Exception as e:
+        print(f"⚠️ follow-up rewrite failed ({type(e).__name__}); using fallback query")
+        return fallback
+
+
+# =========================
+# Public pipelines
+# =========================
+def ask(query: str, history=None) -> str:
+    """Strict Q&A grounded in the report, with inline citations.
+    `history` = [{"role": "user"|"assistant", "content": str}, ...] earlier turns of this chat (optional)."""
+    search_query = _standalone_query(query, history) if history else query
+    topics, _, is_list = analyse_query(search_query)
+    hits = retrieve(search_query, LIST_K if is_list else FINAL_K, is_list)
     if not hits:
         return f"{NO_ANSWER} I couldn't find a relevant passage."
     # Only give up when nothing scored decently AND no topic-tagged case was retrieved.
     if hits[0][2] < MIN_RERANK_SCORE and not topics:
         return f"{NO_ANSWER} I couldn't find a relevant passage."
     tokens = LIST_MAX_TOKENS if is_list else QA_MAX_TOKENS
-    return ask_gemini(build_qa_prompt(hits), f"Question: {query}", max_tokens=tokens)
+    contents = _build_contents(history, query) if history else f"Question: {query}"
+    return clean_answer(ask_gemini(build_qa_prompt(hits), contents, max_tokens=tokens))
 
 
 def run_task(task_prompt: str, retrieval_query: str) -> str:
