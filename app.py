@@ -4,14 +4,17 @@ Streamlit UI for the Coal Mine Accidents Q&A bot.
 All retrieval / prompting / Gemini logic now lives in agent.py (single source of truth):
     dense FAISS + BM25 + topic-tag list -> RRF -> cross-encoder rerank (+ tag/year/name boosts)
     -> Gemini with exponential backoff and fallback model.
-This file only adds the chat UI and the optional RAGAS-style LLM-judge evaluation.
-Keep agent.py in the same folder as this file.
+This file adds the chat UI, saved chat history (SQLite) with conversation memory, and the optional
+RAGAS-style LLM-judge evaluation. Keep agent.py (the version with history support) in the same folder.
 """
 import json
 import os
 import random
 import re
+import sqlite3
 import time
+import uuid
+from contextlib import closing
 
 import streamlit as st
 
@@ -46,18 +49,87 @@ def load_resources():
 
 
 # =========================
+# Saved chats (SQLite) - same tables/schema as main.py, so both apps can share one file
+# =========================
+CHAT_DB = os.getenv("CHAT_DB_PATH") or os.getenv("DB_PATH", "rag_cache.db")
+USER_ID = "default"  # single-user local app; use st.login / a username here if you ever share it
+
+
+def _conn():
+    return closing(sqlite3.connect(CHAT_DB, timeout=10))
+
+
+@st.cache_resource
+def init_chat_db():
+    with _conn() as c, c:
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT 'default', title TEXT NOT NULL DEFAULT 'New chat',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, updated_at)")
+    return True
+
+
+def make_title(text: str) -> str:
+    t = re.sub(r"\s+", " ", text).strip()
+    return (t[:57] + "...") if len(t) > 60 else (t or "New chat")
+
+
+def save_exchange(chat_id, user_text, assistant_text):
+    """Saves one Q/A pair; creates the chat on first use. Returns the chat id."""
+    with _conn() as c, c:
+        if not chat_id:
+            chat_id = uuid.uuid4().hex
+            c.execute("INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)",
+                      (chat_id, USER_ID, make_title(user_text)))
+        c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, 'user', ?)", (chat_id, user_text))
+        c.execute("INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)",
+                  (chat_id, assistant_text))
+        c.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (chat_id,))
+    return chat_id
+
+
+def list_chats(limit=50):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, title FROM sessions WHERE user_id = ? ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+            (USER_ID, limit)).fetchall()
+
+
+def load_chat(chat_id):
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT m.role, m.content FROM messages m JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.session_id = ? AND s.user_id = ? ORDER BY m.id", (chat_id, USER_ID)).fetchall()
+    return [{"role": r, "content": t} for r, t in rows]
+
+
+def delete_chat(chat_id):
+    with _conn() as c, c:
+        c.execute("DELETE FROM messages WHERE session_id = ?", (chat_id,))
+        c.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", (chat_id, USER_ID))
+
+
+# =========================
 # Pipeline (mirrors agent.ask, but keeps the hits for display + evaluation)
 # =========================
-def answer_query(query: str):
-    """Returns (answer, hits). Gemini failures are caught by the caller."""
-    topics, _, is_list = agent.analyse_query(query)
-    hits = agent.retrieve(query, agent.LIST_K if is_list else agent.FINAL_K, is_list)
+def answer_query(query: str, history=None):
+    """Returns (answer, hits). `history` = earlier turns of THIS chat so the model remembers it.
+    Gemini failures are caught by the caller."""
+    history = history or []
+    search_query = agent._standalone_query(query, history) if history else query   # resolves "it", "that mine"...
+    topics, _, is_list = agent.analyse_query(search_query)
+    hits = agent.retrieve(search_query, agent.LIST_K if is_list else agent.FINAL_K, is_list)
 
     if not hits or (hits[0][2] < agent.MIN_RERANK_SCORE and not topics):
         return f"{NO_ANSWER} I couldn't find a relevant passage.", hits
 
     tokens = agent.LIST_MAX_TOKENS if is_list else agent.QA_MAX_TOKENS
-    answer = agent.ask_gemini(agent.build_qa_prompt(hits), f"Question: {query}", max_tokens=tokens)
+    contents = agent._build_contents(history, query) if history else f"Question: {query}"
+    answer = agent.clean_answer(agent.ask_gemini(agent.build_qa_prompt(hits), contents, max_tokens=tokens))
     return answer, hits
 
 
@@ -212,7 +284,18 @@ if not os.getenv("GEMINI_API_KEY"):
     st.error("❌ `GEMINI_API_KEY` not found in Streamlit secrets or environment.")
     st.stop()
 
+init_chat_db()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_id" not in st.session_state:
+    st.session_state.chat_id = None
+
 with st.sidebar:
+    st.header("Chats")
+    if st.button("➕ New chat", use_container_width=True):
+        st.session_state.chat_id, st.session_state.messages = None, []
+    history_box = st.container()   # filled at the bottom of the script, after this turn is saved
+    st.divider()
     st.header("Evaluation")
     eval_on = st.toggle("Compute RAG metrics (extra Gemini call)", value=False)
     reference = st.text_area(
@@ -229,9 +312,6 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -247,8 +327,9 @@ if query := st.chat_input("Ask a question about coal mine accidents…"):
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             t0 = time.perf_counter()
+            past = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[:-1]]
             try:
-                answer, hits = answer_query(query)
+                answer, hits = answer_query(query, past)
             except errors.APIError as e:
                 answer = f"Sorry, the Gemini API request failed ({e.code}). Please try again in a moment."
             except Exception as e:
@@ -275,7 +356,26 @@ if query := st.chat_input("Ask a question about coal mine accidents…"):
                 st.caption(txt[:300] + ("…" if len(txt) > 300 else ""))
         render_metrics(metrics)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer, "metrics": metrics})
+    if failed:
+        # error stays on screen for this run only: not saved, and not fed back to the model as history
+        st.session_state.messages.pop()          # drop the unanswered user message
+    else:
+        st.session_state.messages.append({"role": "assistant", "content": answer, "metrics": metrics})
+        st.session_state.chat_id = save_exchange(st.session_state.chat_id, query, answer)
+
+# Saved chats list (sidebar) - drawn last so a chat that was just created already shows up
+with history_box:
+    for cid, title in list_chats():
+        c1, c2 = st.columns([5, 1])
+        if c1.button(title, key=f"open_{cid}", use_container_width=True,
+                     type="primary" if cid == st.session_state.chat_id else "secondary"):
+            st.session_state.chat_id, st.session_state.messages = cid, load_chat(cid)
+            st.rerun()
+        if c2.button("🗑", key=f"del_{cid}", help="Delete this chat"):
+            delete_chat(cid)
+            if cid == st.session_state.chat_id:
+                st.session_state.chat_id, st.session_state.messages = None, []
+            st.rerun()
 
 # Running averages across this session (sidebar)
 scored = [m["metrics"] for m in st.session_state.messages if m.get("metrics") and not m["metrics"].get("error")]
